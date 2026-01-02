@@ -27,11 +27,12 @@ type Server struct {
 	port        int
 	connMgr     *ConnectionManager
 	presenceMgr *presence.Manager
-	router      *router.Router
+	router      router.RouterInterface // 使用接口支持多种路由实现 / Use interface to support multiple router implementations
 	httpServer  *http.Server
 }
 
-// NewServer creates a new gateway server
+// NewServer creates a new gateway server with Redis Pub/Sub router
+// 创建使用 Redis Pub/Sub 路由器的新 Gateway 服务器
 func NewServer(gatewayID string, port int, redisClient *redis.Client) *Server {
 	presenceMgr := presence.NewManager(redisClient)
 	msgRouter := router.NewRouter(redisClient, gatewayID)
@@ -42,6 +43,20 @@ func NewServer(gatewayID string, port int, redisClient *redis.Client) *Server {
 		connMgr:     NewConnectionManager(),
 		presenceMgr: presenceMgr,
 		router:      msgRouter,
+	}
+}
+
+// NewServerWithRouter creates a new gateway server with a custom router
+// 创建使用自定义路由器的新 Gateway 服务器
+func NewServerWithRouter(gatewayID string, port int, redisClient *redis.Client, customRouter router.RouterInterface) *Server {
+	presenceMgr := presence.NewManager(redisClient)
+
+	return &Server{
+		gatewayID:   gatewayID,
+		port:        port,
+		connMgr:     NewConnectionManager(),
+		presenceMgr: presenceMgr,
+		router:      customRouter,
 	}
 }
 
