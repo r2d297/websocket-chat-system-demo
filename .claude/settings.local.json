@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir:*)",
+      "Bash(go mod download:*)",
+      "Bash(go mod tidy:*)",
+      "Bash(go build:*)",
+      "Bash(chmod:*)",
+      "Bash(tree:*)",
+      "Bash(nc:*)",
+      "Bash(docker-compose up:*)"
+    ]
+  }
+}
