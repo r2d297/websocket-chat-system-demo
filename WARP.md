@@ -107,6 +107,120 @@ This is a **distributed WebSocket gateway system** that enables real-time messag
 - Gateway selection is transparent to users—messages route automatically
 - Two routing implementations: Redis Pub/Sub (simpler) and Kafka (production-grade)
 
+### Detailed Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                                    Client Layer                                      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+            │                              │                              │
+            │ WebSocket                    │ WebSocket                    │ WebSocket
+            │ :8080/ws                     │ :8081/ws                     │ :8082/ws
+            ▼                              ▼                              ▼
+┌─────────────────────┐      ┌─────────────────────┐      ┌─────────────────────┐
+│   Gateway-01        │      │   Gateway-02        │      │   Gateway-03        │
+│   (Port 8080)       │      │   (Port 8081)       │      │   (Port 8082)       │
+├─────────────────────┤      ├─────────────────────┤      ├─────────────────────┤
+│ Server              │      │ Server              │      │ Server              │
+│ ├─ HTTP Endpoints   │      │ ├─ HTTP Endpoints   │      │ ├─ HTTP Endpoints   │
+│ │  • /ws            │      │ │  • /ws            │      │ │  • /ws            │
+│ │  • /health        │      │ │  • /health        │      │ │  • /health        │
+│ │  • /stats         │      │ │  • /stats         │      │ │  • /stats         │
+│ └─ Health Check     │      │ └─ Health Check     │      │ └─ Health Check     │
+│    (60s interval)   │      │    (60s interval)   │      │    (60s interval)   │
+│                     │      │                     │      │                     │
+│ ConnectionManager   │      │ ConnectionManager   │      │ ConnectionManager   │
+│ ├─ userToConn       │      │ ├─ userToConn       │      │ ├─ userToConn       │
+│ │  (sync.Map)       │      │ │  (sync.Map)       │      │ │  (sync.Map)       │
+│ └─ connToUser       │      │ └─ connToUser       │      │ └─ connToUser       │
+│    (sync.Map)       │      │    (sync.Map)       │      │    (sync.Map)       │
+│                     │      │                     │      │                     │
+│ Handler             │      │ Handler             │      │ Handler             │
+│ ├─ Register         │      │ ├─ Register         │      │ ├─ Register         │
+│ ├─ Heartbeat (30s)  │      │ ├─ Heartbeat (30s)  │      │ ├─ Heartbeat (30s)  │
+│ ├─ routeMessage()   │      │ ├─ routeMessage()   │      │ ├─ routeMessage()   │
+│ └─ deliverMessage() │      │ └─ deliverMessage() │      │ └─ deliverMessage() │
+│                     │      │                     │      │                     │
+│ Router (Interface)  │      │ Router (Interface)  │      │ Router (Interface)  │
+│ ├─ Redis Pub/Sub OR │      │ ├─ Redis Pub/Sub OR │      │ ├─ Redis Pub/Sub OR │
+│ └─ Kafka            │      │ └─ Kafka            │      │ └─ Kafka            │
+└──────────┬──────────┘      └──────────┬──────────┘      └──────────┬──────────┘
+           │                            │                            │
+           │         ┌──────────────────┴──────────────────┐         │
+           └─────────┤    Message Routing Layer            ├─────────┘
+                     └──────────┬──────────────────────────┘
+                                │
+                  ┌─────────────┴─────────────┐
+                  │                           │
+          ┌───────▼─────────┐         ┌──────▼────────────────────┐
+          │  Redis Pub/Sub  │   OR    │  Kafka (Production)       │
+          ├─────────────────┤         ├───────────────────────────┤
+          │ Channels:       │         │ Topics:                   │
+          │ • gateway:gw-01 │         │ • gateway-gateway-01 (3p) │
+          │ • gateway:gw-02 │         │ • gateway-gateway-02 (3p) │
+          │ • gateway:gw-03 │         │ • gateway-gateway-03 (3p) │
+          │ • gateway:bcast │         │ • gateway-broadcast (10p) │
+          │                 │         │                           │
+          │ Pattern:        │         │ Features:                 │
+          │ Point-to-point  │         │ • Hash partitioning       │
+          │ Low latency     │         │ • Message persistence     │
+          │                 │         │ • Replay capability       │
+          └─────────────────┘         │ • Consumer groups         │
+                                      └───────────────────────────┘
+                     │
+                     │  All gateways read/write
+                     │
+          ┌──────────▼───────────────────────────────────┐
+          │         Redis (Shared State)                 │
+          ├──────────────────────────────────────────────┤
+          │  Presence Manager (CAS with Lua script)      │
+          │                                              │
+          │  Key: presence:{userId}                      │
+          │  Value: {                                    │
+          │    gwId: "gateway-01"                        │
+          │    connId: "uuid-xxx"                        │
+          │    ts: 1234567890                            │
+          │  }                                           │
+          │  TTL: 90s (auto-expire)                      │
+          │                                              │
+          │  Lua Script (Atomic CAS):                    │
+          │  ├─ Compare timestamp                        │
+          │  ├─ Reject stale updates                     │
+          │  └─ Update if newer                          │
+          └──────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                          Message Flow Example (Alice → Bob)                          │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                      │
+│  1. Alice@Gateway-01 sends: {"type":"message", "to":"bob", "content":"hi"}         │
+│     │                                                                                │
+│     ▼                                                                                │
+│  2. Handler.routeMessage() → Query Redis Presence: "Where is bob?"                  │
+│     │                                                                                │
+│     ▼                                                                                │
+│  3. Redis returns: {gwId: "gateway-02", connId: "...", ts: ...}                     │
+│     │                                                                                │
+│     ▼                                                                                │
+│  4. Router.RouteToGateway("gateway-02", msg)                                        │
+│     │                                                                                │
+│     ├─ Redis: PUBLISH gateway:gateway-02 <msg>                                      │
+│     └─ Kafka: PRODUCE gateway-gateway-02 <msg> (key=bob for ordering)              │
+│                                                                                      │
+│  5. Gateway-02 receives via subscription                                            │
+│     │                                                                                │
+│     ▼                                                                                │
+│  6. Router.processMessages() → Server.deliverMessage(msg)                           │
+│     │                                                                                │
+│     ▼                                                                                │
+│  7. ConnectionManager.GetByUserID("bob") → local Connection                         │
+│     │                                                                                │
+│     ▼                                                                                │
+│  8. Connection.Send() → Bob's WebSocket receives message                            │
+│                                                                                      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
 ### Core Components
 
 #### 1. Gateway Server (`internal/gateway/server.go`)
